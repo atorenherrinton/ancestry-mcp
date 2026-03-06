@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ancestry-mcp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ancestry
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    ports:
+      - "5435:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ancestry"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ancestry-mcp-api
+    container_name: ancestry-mcp-api
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ancestry
+    command: ["node", "mcp-server.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["mcp"]
+    stdin_open: true
+
+volumes:
+  pgdata:

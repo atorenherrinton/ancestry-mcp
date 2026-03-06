@@ -1,0 +1,21 @@
+{
+  "name": "ancestry-mcp",
+  "version": "1.0.0",
+  "description": "Standalone MCP server for ancestry and lineage queries",
+  "main": "mcp-server.js",
+  "scripts": {
+    "start:mcp": "node mcp-server.js",
+    "import:ancestors": "node scripts/import-ged-ancestors.js",
+    "test:mcp-init": "node scripts/mcp-init-smoke.js",
+    "docker:up": "docker compose --profile mcp up -d --build postgres mcp",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose --profile mcp logs -f postgres mcp",
+    "docker:mcp": "docker compose run --rm -i --build mcp"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "pg": "^8.19.0"
+  }
+}
