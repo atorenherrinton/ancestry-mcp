@@ -11,7 +11,7 @@
 const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
-const { Pool } = require("pg");
+const { createPool } = require("../lib/db");
 
 const envPath = path.resolve(__dirname, "..", ".env");
 if (fs.existsSync(envPath)) {
@@ -21,7 +21,7 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = createPool();
 
 function parseGedcom(text) {
   const lines = text.split(/\r?\n/);

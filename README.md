@@ -1,6 +1,6 @@
 # Open Brain Ancestry MCP
 
-Standalone MCP server for ancestry and lineage queries, with its own PostgreSQL database.
+Standalone MCP server for ancestry and lineage queries, now compatible with Supabase-hosted Postgres and Edge Functions.
 
 ## Tools
 
@@ -38,6 +38,8 @@ npm run import:ancestors -- --file /absolute/path/to/tree.ged
 ```bash
 npm run start:mcp
 ```
+
+For Supabase deployment, see [SUPABASE.md](./SUPABASE.md).
 
 ## Database
 

@@ -1,5 +1,7 @@
 # Docker Runbook
 
+For Supabase deployment and Edge Functions, see [SUPABASE.md](./SUPABASE.md).
+
 ## 1) Prepare env
 
 ```bash

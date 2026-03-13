@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS ancestor_relationships (
 );
 
 CREATE INDEX IF NOT EXISTS ancestors_name_trgm_idx
-  ON ancestors USING gin (name gin_trgm_ops);
+  ON ancestors USING gin (name extensions.gin_trgm_ops);
 
 CREATE INDEX IF NOT EXISTS ancestors_surname_idx
   ON ancestors (surname);

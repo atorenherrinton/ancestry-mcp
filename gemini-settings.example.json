@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ancestry-mcp": {
+      "url": "https://kmnmzikkmvicbbwjiqbb.supabase.co/functions/v1/ancestry/mcp",
+      "type": "http",
+      "headers": {
+        "x-ancestry-key": "REPLACE_WITH_YOUR_ANCESTRY_ACCESS_KEY"
+      },
+      "trust": true
+    }
+  }
+}
