@@ -11,7 +11,6 @@
 const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
-const { createPool } = require("../lib/db");
 
 const envPath = path.resolve(__dirname, "..", ".env");
 if (fs.existsSync(envPath)) {
@@ -21,7 +20,35 @@ if (fs.existsSync(envPath)) {
   }
 }
 
-const pool = createPool();
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_KEY || SUPABASE_KEY === "your-secret-key") {
+  console.error("Missing SUPABASE_URL or SUPABASE_SECRET_KEY (service role key) in .env");
+  process.exit(1);
+}
+
+const headers = {
+  apikey: SUPABASE_KEY,
+  Authorization: `Bearer ${SUPABASE_KEY}`,
+  "Content-Type": "application/json",
+  Prefer: "return=representation",
+};
+
+async function supabasePost(table, body, onConflict) {
+  let url = `${SUPABASE_URL}/rest/v1/${table}`;
+  if (onConflict) url += `?on_conflict=${onConflict}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { ...headers, Prefer: "resolution=merge-duplicates,return=representation" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`POST /${table} failed (${res.status}): ${text}`);
+  }
+  return res.json();
+}
 
 function parseGedcom(text) {
   const lines = text.split(/\r?\n/);
@@ -148,79 +175,61 @@ async function importToDb(individuals, families, dryRun) {
     return;
   }
 
-  const client = await pool.connect();
-  try {
-    await client.query("BEGIN");
+  const xrefToUuid = new Map();
+  let personCount = 0;
 
-    const xrefToUuid = new Map();
-    let personCount = 0;
-
-    for (const p of individuals.values()) {
-      const displayName = p.name || p.givenName || "Unknown";
-      const { rows } = await client.query(
-        `INSERT INTO ancestors (gedcom_xref, name, given_name, surname, sex,
-                                birth_date, birth_place, death_date, death_place, burial_place)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         ON CONFLICT (gedcom_xref) DO UPDATE SET
-           name = EXCLUDED.name,
-           given_name = EXCLUDED.given_name,
-           surname = EXCLUDED.surname,
-           sex = EXCLUDED.sex,
-           birth_date = EXCLUDED.birth_date,
-           birth_place = EXCLUDED.birth_place,
-           death_date = EXCLUDED.death_date,
-           death_place = EXCLUDED.death_place,
-           burial_place = EXCLUDED.burial_place
-         RETURNING id`,
-        [
-          p.xref,
-          displayName,
-          p.givenName,
-          p.surname,
-          p.sex,
-          p.birthDate,
-          p.birthPlace,
-          p.deathDate,
-          p.deathPlace,
-          p.burialPlace,
-        ]
-      );
-      xrefToUuid.set(p.xref, rows[0].id);
-      personCount += 1;
+  // Batch persons into chunks for efficiency
+  const personArray = [...individuals.values()];
+  const BATCH_SIZE = 50;
+  for (let i = 0; i < personArray.length; i += BATCH_SIZE) {
+    const batch = personArray.slice(i, i + BATCH_SIZE).map((p) => ({
+      gedcom_xref: p.xref,
+      name: p.name || p.givenName || "Unknown",
+      given_name: p.givenName,
+      surname: p.surname,
+      sex: p.sex,
+      birth_date: p.birthDate,
+      birth_place: p.birthPlace,
+      death_date: p.deathDate,
+      death_place: p.deathPlace,
+      burial_place: p.burialPlace,
+    }));
+    const rows = await supabasePost("ancestors", batch, "gedcom_xref");
+    for (const row of rows) {
+      xrefToUuid.set(row.gedcom_xref, row.id);
     }
+    personCount += rows.length;
+  }
 
-    console.log(`Inserted/updated ${personCount} persons.`);
+  console.log(`Inserted/updated ${personCount} persons.`);
 
-    let relCount = 0;
-    for (const fam of families.values()) {
-      const parentXrefs = [fam.husb, fam.wife].filter(Boolean);
-      for (const childXref of fam.children) {
-        const childId = xrefToUuid.get(childXref);
-        if (!childId) continue;
-        for (const parentXref of parentXrefs) {
-          const parentId = xrefToUuid.get(parentXref);
-          if (!parentId) continue;
-          await client.query(
-            `INSERT INTO ancestor_relationships (parent_id, child_id)
-             VALUES ($1, $2)
-             ON CONFLICT DO NOTHING`,
-            [parentId, childId]
-          );
-          relCount += 1;
-        }
+  let relCount = 0;
+  const relSeen = new Set();
+  const relBatch = [];
+  for (const fam of families.values()) {
+    const parentXrefs = [fam.husb, fam.wife].filter(Boolean);
+    for (const childXref of fam.children) {
+      const childId = xrefToUuid.get(childXref);
+      if (!childId) continue;
+      for (const parentXref of parentXrefs) {
+        const parentId = xrefToUuid.get(parentXref);
+        if (!parentId) continue;
+        const key = `${parentId}:${childId}`;
+        if (relSeen.has(key)) continue;
+        relSeen.add(key);
+        relBatch.push({ parent_id: parentId, child_id: childId });
       }
     }
-
-    console.log(`Inserted ${relCount} parent-child relationships.`);
-
-    await client.query("COMMIT");
-    console.log("Import complete.");
-  } catch (err) {
-    await client.query("ROLLBACK");
-    throw err;
-  } finally {
-    client.release();
   }
+
+  for (let i = 0; i < relBatch.length; i += BATCH_SIZE) {
+    const batch = relBatch.slice(i, i + BATCH_SIZE);
+    await supabasePost("ancestor_relationships", batch, "parent_id,child_id");
+    relCount += batch.length;
+  }
+
+  console.log(`Inserted ${relCount} parent-child relationships.`);
+  console.log("Import complete.");
 }
 
 async function main() {
@@ -260,7 +269,6 @@ async function main() {
   const { individuals, families } = parseGedcom(text);
 
   await importToDb(individuals, families, dryRun);
-  await pool.end();
 }
 
 main().catch((err) => {
