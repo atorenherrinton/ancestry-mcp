@@ -19,6 +19,7 @@
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^17.3.1",
-    "pg": "^8.19.0"
+    "pg": "^8.19.0",
+    "pgvector": "^0.2.0"
   }
 }

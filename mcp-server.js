@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const dotenv = require("dotenv");
+const pgvector = require("pgvector");
 const { createPool } = require("./lib/db");
 
 const envPath = path.resolve(__dirname, ".env");
@@ -13,7 +14,59 @@ if (fs.existsSync(envPath)) {
   }
 }
 
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const MAX_NOTE_CHARS = 12000;
+
 const pool = createPool();
+
+// ─── AI Helpers ───────────────────────────────────────────
+async function getEmbedding(text) {
+  const res = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ model: "openai/text-embedding-3-small", input: text }),
+  });
+  if (!res.ok) throw new Error(`Embedding failed: ${res.status}`);
+  const data = await res.json();
+  return data.data[0].embedding;
+}
+
+async function extractNoteMetadata(text) {
+  const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: `Extract metadata from a personal note about a family ancestor. Return JSON with:
+- "people": array of people mentioned (empty if none)
+- "topics": array of 1-3 short topic tags (always at least one, e.g. "immigration", "military", "occupation", "marriage", "religion")
+- "type": one of "story", "research_note", "source_reference", "question", "observation"
+- "time_period": approximate era if mentioned (e.g. "1800s", "Civil War", "colonial") or null
+- "locations": array of places mentioned (empty if none)
+Only extract what's explicitly there.`,
+        },
+        { role: "user", content: text },
+      ],
+    }),
+  });
+  const data = await res.json();
+  try {
+    return JSON.parse(data.choices[0].message.content);
+  } catch {
+    return { topics: ["uncategorized"], type: "observation" };
+  }
+}
 
 let transportMode = "unknown";
 
@@ -108,7 +161,69 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: "capture_ancestor_note",
+    description:
+      "Save a personal note about an ancestor. Automatically generates a semantic embedding and extracts metadata. Optionally link to a specific ancestor by name (will fuzzy-match).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: {
+          type: "string",
+          description: "The note to save — a clear, standalone statement about an ancestor",
+        },
+        ancestor_name: {
+          type: "string",
+          description: "Name of the ancestor this note is about (fuzzy matched). Optional.",
+        },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "search_ancestor_notes",
+    description:
+      "Search your personal ancestor notes by meaning. Use this when looking for notes about a topic, person, story, or research question you've previously captured.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "What to search for" },
+        ancestor_name: {
+          type: "string",
+          description: "Optionally limit search to notes about a specific ancestor (fuzzy matched)",
+        },
+        limit: { type: "number", description: "Max results (default 10)", default: 10 },
+        threshold: { type: "number", description: "Similarity threshold 0-1 (default 0.5)", default: 0.5 },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "list_ancestor_notes",
+    description:
+      "List personal ancestor notes with optional filters by type, topic, ancestor name, or time range.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", default: 10 },
+        type: { type: "string", description: "Filter: story, research_note, source_reference, question, observation" },
+        topic: { type: "string", description: "Filter by topic tag" },
+        ancestor_name: { type: "string", description: "Filter by ancestor name (fuzzy matched)" },
+        days: { type: "number", description: "Only notes from the last N days" },
+      },
+    },
+  },
 ];
+
+// ─── Helper: resolve ancestor by fuzzy name ───────────────
+async function resolveAncestorId(name) {
+  if (!name) return null;
+  const { rows } = await pool.query(
+    `SELECT id, name FROM ancestors WHERE name ILIKE $1 ORDER BY name LIMIT 1`,
+    [`%${name}%`]
+  );
+  return rows.length ? rows[0] : null;
+}
 
 async function handleAncestorStats() {
   const { rows: countRows } = await pool.query("SELECT count(*) FROM ancestors");
@@ -332,6 +447,116 @@ async function handleFindAncestors({
   return lines.join("\n");
 }
 
+// ─── Ancestor Notes Handlers ──────────────────────────────
+
+async function handleCaptureAncestorNote({ content, ancestor_name }) {
+  const normalizedContent = String(content ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/^[\t ]+/gm, "")
+    .replace(/[\t ]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .replace(/\s+/g, " ");
+
+  if (!normalizedContent) {
+    throw new Error("Note content cannot be empty.");
+  }
+
+  if (normalizedContent.length > MAX_NOTE_CHARS) {
+    throw new Error(
+      `Note is too long (${normalizedContent.length} chars). Max allowed is ${MAX_NOTE_CHARS}.`
+    );
+  }
+
+  const ancestor = await resolveAncestorId(ancestor_name);
+
+  const [embedding, metadata] = await Promise.all([
+    getEmbedding(normalizedContent),
+    extractNoteMetadata(normalizedContent),
+  ]);
+
+  await pool.query(
+    `INSERT INTO ancestor_notes (ancestor_id, content, embedding, metadata) VALUES ($1, $2, $3, $4)`,
+    [ancestor ? ancestor.id : null, normalizedContent, pgvector.toSql(embedding), { ...metadata, source: "mcp" }]
+  );
+
+  let confirmation = `Saved as ${metadata.type || "note"}`;
+  if (ancestor) confirmation += ` for ${ancestor.name}`;
+  if (metadata.topics?.length) confirmation += ` — ${metadata.topics.join(", ")}`;
+  if (metadata.locations?.length) confirmation += ` | Places: ${metadata.locations.join(", ")}`;
+  if (metadata.time_period) confirmation += ` | Era: ${metadata.time_period}`;
+  return confirmation;
+}
+
+async function handleSearchAncestorNotes({ query, ancestor_name, limit = 10, threshold = 0.5 }) {
+  const qEmb = await getEmbedding(query);
+  const ancestor = await resolveAncestorId(ancestor_name);
+
+  const { rows } = await pool.query(
+    `SELECT * FROM match_ancestor_notes($1, $2, $3, $4, $5)`,
+    [pgvector.toSql(qEmb), threshold, limit, "{}", ancestor ? ancestor.id : null]
+  );
+  if (!rows.length) return `No ancestor notes found matching "${query}".`;
+
+  return rows
+    .map((n, i) => {
+      const m = n.metadata || {};
+      const parts = [
+        `--- Result ${i + 1} (${(n.similarity * 100).toFixed(1)}% match) ---`,
+        `Captured: ${new Date(n.created_at).toLocaleDateString()}`,
+        `Type: ${m.type || "unknown"}`,
+      ];
+      if (n.ancestor_name) parts.push(`Ancestor: ${n.ancestor_name}`);
+      if (m.topics?.length) parts.push(`Topics: ${m.topics.join(", ")}`);
+      if (m.locations?.length) parts.push(`Places: ${m.locations.join(", ")}`);
+      if (m.time_period) parts.push(`Era: ${m.time_period}`);
+      if (m.people?.length) parts.push(`People: ${m.people.join(", ")}`);
+      parts.push(`\n${n.content}`);
+      return parts.join("\n");
+    })
+    .join("\n\n");
+}
+
+async function handleListAncestorNotes({ limit = 10, type, topic, ancestor_name, days }) {
+  let sql = `SELECT n.id, n.content, n.metadata, n.created_at, a.name AS ancestor_name
+    FROM ancestor_notes n LEFT JOIN ancestors a ON a.id = n.ancestor_id`;
+  const conditions = [];
+  const params = [];
+  let idx = 1;
+
+  if (type) {
+    conditions.push(`n.metadata->>'type' = $${idx++}`);
+    params.push(type);
+  }
+  if (topic) {
+    conditions.push(`n.metadata->'topics' ? $${idx++}`);
+    params.push(topic);
+  }
+  if (ancestor_name) {
+    conditions.push(`a.name ILIKE $${idx++}`);
+    params.push(`%${ancestor_name}%`);
+  }
+  if (days) {
+    conditions.push(`n.created_at >= now() - interval '${parseInt(days)} days'`);
+  }
+
+  if (conditions.length) sql += ` WHERE ` + conditions.join(" AND ");
+  sql += ` ORDER BY n.created_at DESC LIMIT $${idx}`;
+  params.push(parseInt(limit));
+
+  const { rows } = await pool.query(sql, params);
+  if (!rows.length) return "No ancestor notes found.";
+
+  return rows
+    .map((n, i) => {
+      const m = n.metadata || {};
+      const tags = m.topics?.length ? m.topics.join(", ") : "";
+      const who = n.ancestor_name ? ` [${n.ancestor_name}]` : "";
+      return `${i + 1}. [${new Date(n.created_at).toLocaleDateString()}] (${m.type || "??"}${tags ? " — " + tags : ""})${who}\n   ${n.content}`;
+    })
+    .join("\n\n");
+}
+
 function formatAncestor(a) {
   const parts = [`${a.name}`];
   if (a.sex) parts[0] += ` (${a.sex === "M" ? "Male" : a.sex === "F" ? "Female" : a.sex})`;
@@ -451,6 +676,15 @@ async function handleMessage(msg) {
           break;
         case "find_ancestors":
           result = await handleFindAncestors(args);
+          break;
+        case "capture_ancestor_note":
+          result = await handleCaptureAncestorNote(args);
+          break;
+        case "search_ancestor_notes":
+          result = await handleSearchAncestorNotes(args);
+          break;
+        case "list_ancestor_notes":
+          result = await handleListAncestorNotes(args);
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);

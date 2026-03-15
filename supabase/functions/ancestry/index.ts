@@ -3,6 +3,9 @@ import { McpServer } from "npm:@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "npm:@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "npm:zod@3.24.1";
 
+const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
+const MAX_NOTE_CHARS = 12000;
+
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), {
     status,
@@ -160,6 +163,305 @@ function getAction(url: URL) {
     return url.searchParams.get("action") || "";
   }
   return parts.slice(functionIndex + 1).join("/") || url.searchParams.get("action") || "";
+}
+
+function requireOpenRouterApiKey() {
+  return requireEnv("OPENROUTER_API_KEY");
+}
+
+function toVectorLiteral(embedding: number[]) {
+  return `[${embedding.join(",")}]`;
+}
+
+async function getEmbedding(text: string): Promise<number[]> {
+  const res = await fetch(`${OPENROUTER_BASE}/embeddings`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${requireOpenRouterApiKey()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ model: "openai/text-embedding-3-small", input: text }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Embedding failed: ${res.status}`);
+  }
+
+  const data = await res.json();
+  const embedding = data?.data?.[0]?.embedding;
+  if (!Array.isArray(embedding)) {
+    throw new Error("Embedding response missing vector data");
+  }
+
+  return embedding as number[];
+}
+
+async function extractNoteMetadata(text: string): Promise<Record<string, unknown>> {
+  const res = await fetch(`${OPENROUTER_BASE}/chat/completions`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${requireOpenRouterApiKey()}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "openai/gpt-4o-mini",
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "Extract metadata from a personal note about a family ancestor. Return JSON with:\n" +
+            '- "people": array of people mentioned (empty if none)\n' +
+            '- "topics": array of 1-3 short topic tags (always at least one, e.g. "immigration", "military", "occupation", "marriage", "religion")\n' +
+            '- "type": one of "story", "research_note", "source_reference", "question", "observation"\n' +
+            '- "time_period": approximate era if mentioned (e.g. "1800s", "Civil War", "colonial") or null\n' +
+            '- "locations": array of places mentioned (empty if none)\n' +
+            "Only extract what's explicitly there.",
+        },
+        { role: "user", content: text },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Metadata extraction failed: ${res.status}`);
+  }
+
+  const data = await res.json();
+  try {
+    return JSON.parse(data.choices[0].message.content);
+  } catch {
+    return { topics: ["uncategorized"], type: "observation" };
+  }
+}
+
+async function resolveAncestorByName(
+  supabase: ReturnType<typeof createClient>,
+  name: string | undefined
+) {
+  if (!name) {
+    return null;
+  }
+
+  const { data, error } = await supabase
+    .from("ancestors")
+    .select("id, name")
+    .ilike("name", `%${name}%`)
+    .order("name", { ascending: true })
+    .limit(1);
+
+  if (error) {
+    throw error;
+  }
+
+  return data?.[0] ?? null;
+}
+
+function normalizeNoteContent(content: unknown) {
+  return String(content ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/^[\t ]+/gm, "")
+    .replace(/[\t ]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+async function captureAncestorNote(
+  supabase: ReturnType<typeof createClient>,
+  args: Record<string, unknown>
+) {
+  const content = normalizeNoteContent(args.content);
+  if (!content) {
+    throw new Error("Note content cannot be empty.");
+  }
+
+  if (content.length > MAX_NOTE_CHARS) {
+    throw new Error(`Note is too long (${content.length} chars). Max allowed is ${MAX_NOTE_CHARS}.`);
+  }
+
+  const ancestor = await resolveAncestorByName(
+    supabase,
+    typeof args.ancestor_name === "string" ? args.ancestor_name : undefined
+  );
+
+  const [embedding, metadata] = await Promise.all([
+    getEmbedding(content),
+    extractNoteMetadata(content),
+  ]);
+
+  const metadataWithSource = {
+    ...(metadata ?? {}),
+    source: "mcp",
+  };
+
+  const { error } = await supabase.from("ancestor_notes").insert({
+    ancestor_id: ancestor?.id ?? null,
+    content,
+    embedding: toVectorLiteral(embedding),
+    metadata: metadataWithSource,
+  });
+
+  if (error) {
+    throw error;
+  }
+
+  const topics = Array.isArray((metadataWithSource as Record<string, unknown>).topics)
+    ? ((metadataWithSource as Record<string, unknown>).topics as string[])
+    : [];
+  const locations = Array.isArray((metadataWithSource as Record<string, unknown>).locations)
+    ? ((metadataWithSource as Record<string, unknown>).locations as string[])
+    : [];
+  const type =
+    typeof (metadataWithSource as Record<string, unknown>).type === "string"
+      ? ((metadataWithSource as Record<string, unknown>).type as string)
+      : "note";
+  const timePeriod =
+    typeof (metadataWithSource as Record<string, unknown>).time_period === "string"
+      ? ((metadataWithSource as Record<string, unknown>).time_period as string)
+      : null;
+
+  let confirmation = `Saved as ${type}`;
+  if (ancestor?.name) {
+    confirmation += ` for ${ancestor.name}`;
+  }
+  if (topics.length) {
+    confirmation += ` - ${topics.join(", ")}`;
+  }
+  if (locations.length) {
+    confirmation += ` | Places: ${locations.join(", ")}`;
+  }
+  if (timePeriod) {
+    confirmation += ` | Era: ${timePeriod}`;
+  }
+
+  return { message: confirmation };
+}
+
+async function searchAncestorNotes(
+  supabase: ReturnType<typeof createClient>,
+  args: Record<string, unknown>
+) {
+  const query = typeof args.query === "string" ? args.query.trim() : "";
+  if (!query) {
+    throw new Error("query is required");
+  }
+
+  const limit = Number(args.limit ?? 10);
+  const threshold = Number(args.threshold ?? 0.5);
+  const ancestor = await resolveAncestorByName(
+    supabase,
+    typeof args.ancestor_name === "string" ? args.ancestor_name : undefined
+  );
+
+  const queryEmbedding = await getEmbedding(query);
+  const { data, error } = await supabase.rpc("match_ancestor_notes", {
+    query_embedding: toVectorLiteral(queryEmbedding),
+    match_threshold: threshold,
+    match_count: limit,
+    filter: {},
+    p_ancestor_id: ancestor?.id ?? null,
+  });
+
+  if (error) {
+    throw error;
+  }
+
+  const rows = data ?? [];
+  if (!rows.length) {
+    return { message: `No ancestor notes found matching "${query}".` };
+  }
+
+  const lines: string[] = [];
+  rows.forEach((note: Record<string, unknown>, index: number) => {
+    const metadata = (note.metadata ?? {}) as Record<string, unknown>;
+    const similarity =
+      typeof note.similarity === "number" ? `${(note.similarity * 100).toFixed(1)}%` : "n/a";
+
+    lines.push(`--- Result ${index + 1} (${similarity} match) ---`);
+    if (note.created_at) {
+      lines.push(`Captured: ${new Date(String(note.created_at)).toLocaleDateString()}`);
+    }
+    lines.push(`Type: ${String(metadata.type ?? "unknown")}`);
+    if (note.ancestor_name) {
+      lines.push(`Ancestor: ${String(note.ancestor_name)}`);
+    }
+    if (Array.isArray(metadata.topics) && metadata.topics.length) {
+      lines.push(`Topics: ${(metadata.topics as unknown[]).map(String).join(", ")}`);
+    }
+    if (Array.isArray(metadata.locations) && metadata.locations.length) {
+      lines.push(`Places: ${(metadata.locations as unknown[]).map(String).join(", ")}`);
+    }
+    if (metadata.time_period) {
+      lines.push(`Era: ${String(metadata.time_period)}`);
+    }
+    if (Array.isArray(metadata.people) && metadata.people.length) {
+      lines.push(`People: ${(metadata.people as unknown[]).map(String).join(", ")}`);
+    }
+    lines.push("", String(note.content ?? ""));
+    lines.push("");
+  });
+
+  return { message: lines.join("\n").trim() };
+}
+
+async function listAncestorNotes(
+  supabase: ReturnType<typeof createClient>,
+  args: Record<string, unknown>
+) {
+  const limit = Number(args.limit ?? 10);
+  const type = typeof args.type === "string" ? args.type : undefined;
+  const topic = typeof args.topic === "string" ? args.topic : undefined;
+  const days = Number(args.days);
+  const ancestorName = typeof args.ancestor_name === "string" ? args.ancestor_name : undefined;
+
+  let query = supabase
+    .from("ancestor_notes")
+    .select("id, content, metadata, created_at, ancestors:ancestor_id(name)")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (type) {
+    query = query.eq("metadata->>type", type);
+  }
+  if (topic) {
+    query = query.filter("metadata->topics", "cs", JSON.stringify([topic]));
+  }
+  if (days && Number.isFinite(days) && days > 0) {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    query = query.gte("created_at", since);
+  }
+  if (ancestorName) {
+    query = query.ilike("ancestors.name", `%${ancestorName}%`);
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    throw error;
+  }
+
+  const rows = data ?? [];
+  if (!rows.length) {
+    return { message: "No ancestor notes found." };
+  }
+
+  const lines = rows.map((note: Record<string, unknown>, index: number) => {
+    const metadata = (note.metadata ?? {}) as Record<string, unknown>;
+    const topics = Array.isArray(metadata.topics)
+      ? (metadata.topics as unknown[]).map(String).join(", ")
+      : "";
+    const ancestor =
+      note.ancestors && typeof note.ancestors === "object"
+        ? (note.ancestors as Record<string, unknown>).name
+        : null;
+    const header = `${index + 1}. [${new Date(String(note.created_at)).toLocaleDateString()}] (${String(
+      metadata.type ?? "??"
+    )}${topics ? ` - ${topics}` : ""})${ancestor ? ` [${String(ancestor)}]` : ""}`;
+
+    return `${header}\n   ${String(note.content ?? "")}`;
+  });
+
+  return { message: lines.join("\n\n") };
 }
 
 function extractCountry(place: string | null) {
@@ -421,9 +723,64 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
       }),
       annotations: { readOnlyHint: true },
     },
-    async (args) => {
+    async (args: unknown) => {
       const result = await searchAncestors(supabase, args as Record<string, unknown>);
       return { content: [{ type: "text", text: formatSearchText(result) }] };
+    }
+  );
+
+  server.registerTool(
+    "capture_ancestor_note",
+    {
+      description:
+        "Save a personal note about an ancestor. Automatically generates a semantic embedding and extracts metadata. Optionally links the note to a specific ancestor by fuzzy name.",
+      inputSchema: z.object({
+        content: z.string(),
+        ancestor_name: z.string().optional(),
+      }),
+    },
+    async (args: unknown) => {
+      const result = await captureAncestorNote(supabase, args as Record<string, unknown>);
+      return { content: [{ type: "text", text: result.message }] };
+    }
+  );
+
+  server.registerTool(
+    "search_ancestor_notes",
+    {
+      description:
+        "Search personal ancestor notes by meaning. Supports optional ancestor filter, result limit, and similarity threshold.",
+      inputSchema: z.object({
+        query: z.string(),
+        ancestor_name: z.string().optional(),
+        limit: z.number().optional(),
+        threshold: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async (args: unknown) => {
+      const result = await searchAncestorNotes(supabase, args as Record<string, unknown>);
+      return { content: [{ type: "text", text: result.message }] };
+    }
+  );
+
+  server.registerTool(
+    "list_ancestor_notes",
+    {
+      description:
+        "List personal ancestor notes, optionally filtered by type, topic, ancestor name, or recent days.",
+      inputSchema: z.object({
+        limit: z.number().optional(),
+        type: z.string().optional(),
+        topic: z.string().optional(),
+        ancestor_name: z.string().optional(),
+        days: z.number().optional(),
+      }),
+      annotations: { readOnlyHint: true },
+    },
+    async (args: unknown) => {
+      const result = await listAncestorNotes(supabase, args as Record<string, unknown>);
+      return { content: [{ type: "text", text: result.message }] };
     }
   );
 
