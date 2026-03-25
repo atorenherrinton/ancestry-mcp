@@ -71,6 +71,63 @@ AS $$
   SELECT * FROM lineage ORDER BY generation, name;
 $$;
 
+-- ─── Find Relationship ───────────────────────────────────
+
+CREATE OR REPLACE FUNCTION find_relationship(
+  person_a UUID,
+  person_b UUID,
+  max_depth INT DEFAULT 30
+)
+RETURNS TABLE (
+  common_ancestor_id UUID,
+  common_ancestor_name TEXT,
+  generations_from_a INT,
+  generations_from_b INT,
+  path_from_a UUID[],
+  path_from_b UUID[]
+)
+LANGUAGE sql STABLE
+AS $$
+  WITH RECURSIVE
+  ancestors_a AS (
+    SELECT a.id, a.name, 0 AS generation, ARRAY[a.id] AS path
+    FROM ancestors a WHERE a.id = person_a
+    UNION ALL
+    SELECT a.id, a.name, aa.generation + 1, aa.path || a.id
+    FROM ancestors a
+    JOIN ancestor_relationships ar ON ar.parent_id = a.id
+    JOIN ancestors_a aa ON ar.child_id = aa.id
+    WHERE aa.generation < max_depth
+      AND NOT a.id = ANY(aa.path)
+  ),
+  ancestors_b AS (
+    SELECT a.id, a.name, 0 AS generation, ARRAY[a.id] AS path
+    FROM ancestors a WHERE a.id = person_b
+    UNION ALL
+    SELECT a.id, a.name, ab.generation + 1, ab.path || a.id
+    FROM ancestors a
+    JOIN ancestor_relationships ar ON ar.parent_id = a.id
+    JOIN ancestors_b ab ON ar.child_id = ab.id
+    WHERE ab.generation < max_depth
+      AND NOT a.id = ANY(ab.path)
+  ),
+  common AS (
+    SELECT DISTINCT ON (aa.id)
+      aa.id AS common_ancestor_id,
+      aa.name AS common_ancestor_name,
+      aa.generation AS generations_from_a,
+      ab.generation AS generations_from_b,
+      aa.path AS path_from_a,
+      ab.path AS path_from_b
+    FROM ancestors_a aa
+    JOIN ancestors_b ab ON aa.id = ab.id
+    ORDER BY aa.id, (aa.generation + ab.generation) ASC
+  )
+  SELECT * FROM common
+  ORDER BY (generations_from_a + generations_from_b) ASC
+  LIMIT 5;
+$$;
+
 -- ─── Ancestor Notes (with embeddings) ────────────────────
 
 CREATE TABLE IF NOT EXISTS ancestor_notes (

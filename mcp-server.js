@@ -82,6 +82,172 @@ function send(msg) {
   process.stdout.write(header + payload);
 }
 
+// ─── Relationship Helpers ─────────────────────────────────
+function getRelationshipLabel(genA, genB, sexOfB) {
+  if (genA === 0 && genB === 0) return "the same person";
+
+  // Direct ancestor (B is ancestor of A)
+  if (genB === 0) {
+    if (genA === 1) return sexOfB === "F" ? "your mother" : "your father";
+    if (genA === 2) return sexOfB === "F" ? "your grandmother" : "your grandfather";
+    if (genA === 3) return sexOfB === "F" ? "your great-grandmother" : "your great-grandfather";
+    const greats = genA - 2;
+    const prefix = greats === 1 ? "great" : `${greats}x great`;
+    return sexOfB === "F" ? `your ${prefix}-grandmother` : `your ${prefix}-grandfather`;
+  }
+
+  // Direct descendant (A is ancestor of B)
+  if (genA === 0) {
+    if (genB === 1) return sexOfB === "F" ? "your daughter" : "your son";
+    if (genB === 2) return sexOfB === "F" ? "your granddaughter" : "your grandson";
+    const greats = genB - 2;
+    const prefix = greats === 1 ? "great" : `${greats}x great`;
+    return sexOfB === "F" ? `your ${prefix}-granddaughter` : `your ${prefix}-grandson`;
+  }
+
+  // Siblings
+  if (genA === 1 && genB === 1) {
+    return sexOfB === "F" ? "your sister" : sexOfB === "M" ? "your brother" : "your sibling";
+  }
+
+  // Aunt/Uncle (parent's sibling)
+  if (genA === 2 && genB === 1) {
+    return sexOfB === "F" ? "your aunt" : sexOfB === "M" ? "your uncle" : "your aunt/uncle";
+  }
+
+  // Niece/Nephew (sibling's child)
+  if (genA === 1 && genB === 2) {
+    return sexOfB === "F" ? "your niece" : sexOfB === "M" ? "your nephew" : "your niece/nephew";
+  }
+
+  // Great-aunt/uncle
+  if (genB === 1 && genA > 2) {
+    const greats = genA - 2;
+    const prefix = greats === 1 ? "great" : `${greats}x great`;
+    return sexOfB === "F" ? `your ${prefix}-aunt` : sexOfB === "M" ? `your ${prefix}-uncle` : `your ${prefix}-aunt/uncle`;
+  }
+
+  // Grand-niece/nephew
+  if (genA === 1 && genB > 2) {
+    const greats = genB - 2;
+    const prefix = greats === 1 ? "great" : `${greats}x great`;
+    return sexOfB === "F" ? `your ${prefix}-niece` : sexOfB === "M" ? `your ${prefix}-nephew` : `your ${prefix}-niece/nephew`;
+  }
+
+  // Cousins
+  const cousinDegree = Math.min(genA, genB) - 1;
+  const removed = Math.abs(genA - genB);
+
+  const ordinals = ["", "1st", "2nd", "3rd"];
+  const ord = cousinDegree < ordinals.length ? ordinals[cousinDegree] : `${cousinDegree}th`;
+
+  let label = `your ${ord} cousin`;
+  if (removed === 1) label += " once removed";
+  else if (removed === 2) label += " twice removed";
+  else if (removed === 3) label += " thrice removed";
+  else if (removed > 3) label += ` ${removed}x removed`;
+
+  return label;
+}
+
+function describePathSegment(sex) {
+  return sex === "F" ? "mother" : sex === "M" ? "father" : "parent";
+}
+
+async function buildPathDescription(pathIds) {
+  // pathIds: [root, parent, grandparent, ..., common_ancestor]
+  // We describe positions 1..n-1 (the intermediates leading to common ancestor)
+  if (pathIds.length <= 2) return null; // Direct parent, no "through" needed
+
+  const intermediateIds = pathIds.slice(1, -1); // exclude root and common ancestor
+  if (!intermediateIds.length) return null;
+
+  const placeholders = intermediateIds.map((_, i) => `$${i + 1}`).join(", ");
+  const { rows } = await pool.query(
+    `SELECT id, name, sex FROM ancestors WHERE id IN (${placeholders})`,
+    intermediateIds
+  );
+  const byId = new Map(rows.map((r) => [r.id, r]));
+
+  const parts = intermediateIds.map((id) => {
+    const person = byId.get(id);
+    return person ? describePathSegment(person.sex) : "parent";
+  });
+
+  return "through your " + parts.join("'s ");
+}
+
+async function handleFindRelationship({ ancestor_name, ancestor_id }) {
+  const rootXref = process.env.ROOT_PERSON_XREF;
+  if (!rootXref) {
+    return "ROOT_PERSON_XREF environment variable is not set. Set it to your GEDCOM cross-reference ID (e.g. @I1@) to use this tool.";
+  }
+
+  // Resolve root person
+  const { rows: rootRows } = await pool.query(
+    `SELECT id, name, sex FROM ancestors WHERE gedcom_xref = $1`,
+    [rootXref]
+  );
+  if (!rootRows.length) {
+    return `Could not find root person with GEDCOM xref "${rootXref}".`;
+  }
+  const rootPerson = rootRows[0];
+
+  // Resolve target person
+  let targetPerson;
+  if (ancestor_id) {
+    const { rows } = await pool.query(`SELECT id, name, sex FROM ancestors WHERE id = $1`, [ancestor_id]);
+    if (!rows.length) return `No ancestor found with ID "${ancestor_id}".`;
+    targetPerson = rows[0];
+  } else if (ancestor_name) {
+    const resolved = await resolveAncestorId(ancestor_name);
+    if (!resolved) return `No ancestor found matching "${ancestor_name}".`;
+    const { rows } = await pool.query(`SELECT id, name, sex FROM ancestors WHERE id = $1`, [resolved.id]);
+    targetPerson = rows[0];
+  } else {
+    return "Please provide an ancestor_name or ancestor_id.";
+  }
+
+  if (rootPerson.id === targetPerson.id) {
+    return "That's you!";
+  }
+
+  // Find relationship via common ancestors
+  const { rows: rels } = await pool.query(
+    `SELECT * FROM find_relationship($1, $2, $3)`,
+    [rootPerson.id, targetPerson.id, 30]
+  );
+
+  if (!rels.length) {
+    return `No relationship found between you (${rootPerson.name}) and ${targetPerson.name} within 30 generations.`;
+  }
+
+  const best = rels[0];
+  const label = getRelationshipLabel(best.generations_from_a, best.generations_from_b, targetPerson.sex);
+
+  const lines = [
+    `${targetPerson.name} is ${label}.`,
+  ];
+
+  // Build path description ("through your father's mother")
+  if (best.path_from_a && best.path_from_a.length > 2) {
+    const pathDesc = await buildPathDescription(best.path_from_a);
+    if (pathDesc) lines.push(`Connection: ${pathDesc}.`);
+  }
+
+  lines.push(`Common ancestor: ${best.common_ancestor_name} (${best.generations_from_a} generation${best.generations_from_a !== 1 ? "s" : ""} from you, ${best.generations_from_b} generation${best.generations_from_b !== 1 ? "s" : ""} from them).`);
+
+  // Show other common ancestors if any
+  if (rels.length > 1) {
+    lines.push("", "Other common ancestors:");
+    for (let i = 1; i < rels.length; i++) {
+      lines.push(`  ${rels[i].common_ancestor_name} (${rels[i].generations_from_a} gen / ${rels[i].generations_from_b} gen)`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
 const TOOLS = [
   {
     name: "ancestor_stats",
@@ -210,6 +376,24 @@ const TOOLS = [
         topic: { type: "string", description: "Filter by topic tag" },
         ancestor_name: { type: "string", description: "Filter by ancestor name (fuzzy matched)" },
         days: { type: "number", description: "Only notes from the last N days" },
+      },
+    },
+  },
+  {
+    name: "find_relationship",
+    description:
+      "Find how an ancestor is related to you (e.g. '2nd cousin twice removed through your father's mother'). Requires ROOT_PERSON_XREF env var to be set.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ancestor_name: {
+          type: "string",
+          description: "Name of the ancestor to find your relationship with (fuzzy matched)",
+        },
+        ancestor_id: {
+          type: "string",
+          description: "UUID of the ancestor (alternative to name)",
+        },
       },
     },
   },
@@ -685,6 +869,9 @@ async function handleMessage(msg) {
           break;
         case "list_ancestor_notes":
           result = await handleListAncestorNotes(args);
+          break;
+        case "find_relationship":
+          result = await handleFindRelationship(args);
           break;
         default:
           throw new Error(`Unknown tool: ${name}`);
