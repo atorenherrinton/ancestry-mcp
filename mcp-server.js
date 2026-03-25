@@ -177,6 +177,49 @@ async function buildPathDescription(pathIds) {
   return "through your " + parts.join("'s ");
 }
 
+async function buildLineageTrace(pathFromA, pathFromB, rootName) {
+  // pathFromA: [root, parent, grandparent, ..., common_ancestor] (root→up)
+  // pathFromB: [target, parent, grandparent, ..., common_ancestor] (target→up)
+  // We want: ancestor → ... → common_ancestor → ... → you
+  // For direct ancestors (pathFromB length 1): just reverse pathFromA
+  // For cousins: reverse pathFromB (minus common ancestor) + reverse pathFromA
+
+  const allIds = new Set([...pathFromA, ...pathFromB]);
+  const placeholders = [...allIds].map((_, i) => `$${i + 1}`).join(", ");
+  const { rows } = await pool.query(
+    `SELECT id, name, given_name, sex, birth_date FROM ancestors WHERE id IN (${placeholders})`,
+    [...allIds]
+  );
+  const byId = new Map(rows.map((r) => [r.id, r]));
+
+  function personLabel(id) {
+    const p = byId.get(id);
+    if (!p) return "Unknown";
+    const year = p.birth_date ? (p.birth_date.match(/(\d{4})/) || [])[1] : null;
+    return year ? `${p.name} (b. ${year})` : p.name;
+  }
+
+  // Build the chain
+  const reversedA = [...pathFromA].reverse(); // common_ancestor → ... → root
+  const reversedB = [...pathFromB].reverse(); // common_ancestor → ... → target
+
+  if (pathFromB.length <= 1) {
+    // Direct ancestor: target IS the common ancestor
+    // Chain: ancestor → ... → you
+    return reversedA.map((id) => personLabel(id));
+  }
+
+  // Cousin/indirect: show both branches from common ancestor
+  // target's line (up to common ancestor) + root's line (down from common ancestor)
+  // reversedB = [common_ancestor, ..., target]
+  // reversedA = [common_ancestor, ..., root]
+  // We show: target → ... → common_ancestor → ... → you
+  const targetBranch = [...pathFromB].map((id) => personLabel(id)); // target → ... → common_ancestor
+  const rootBranch = reversedA.slice(1).map((id) => personLabel(id)); // skip common_ancestor (already in targetBranch)
+
+  return [...targetBranch, ...rootBranch];
+}
+
 async function handleFindRelationship({ ancestor_name, ancestor_id }) {
   const rootXref = process.env.ROOT_PERSON_XREF;
   if (!rootXref) {
@@ -236,6 +279,13 @@ async function handleFindRelationship({ ancestor_name, ancestor_id }) {
   }
 
   lines.push(`Common ancestor: ${best.common_ancestor_name} (${best.generations_from_a} generation${best.generations_from_a !== 1 ? "s" : ""} from you, ${best.generations_from_b} generation${best.generations_from_b !== 1 ? "s" : ""} from them).`);
+
+  // Build lineage trace
+  if (best.path_from_a && best.path_from_a.length > 0) {
+    const trace = await buildLineageTrace(best.path_from_a, best.path_from_b || [targetPerson.id], rootPerson.name);
+    lines.push("", "Lineage trace:");
+    lines.push(trace.join(" → "));
+  }
 
   // Show other common ancestors if any
   if (rels.length > 1) {

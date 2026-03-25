@@ -700,6 +700,42 @@ async function buildPathDescription(
   return "through your " + parts.join("'s ");
 }
 
+async function buildLineageTrace(
+  supabase: ReturnType<typeof createClient>,
+  pathFromA: string[],
+  pathFromB: string[]
+): Promise<string[]> {
+  const allIds = [...new Set([...pathFromA, ...pathFromB])];
+
+  const { data, error } = await supabase
+    .from("ancestors")
+    .select("id, name, birth_date")
+    .in("id", allIds);
+
+  if (error) throw error;
+
+  const byId = new Map((data ?? []).map((r: Record<string, unknown>) => [r.id, r]));
+
+  function personLabel(id: string): string {
+    const p = byId.get(id) as Record<string, unknown> | undefined;
+    if (!p) return "Unknown";
+    const dateStr = p.birth_date ? String(p.birth_date) : "";
+    const yearMatch = dateStr.match(/(\d{4})/);
+    return yearMatch ? `${p.name} (b. ${yearMatch[1]})` : String(p.name ?? "Unknown");
+  }
+
+  const reversedA = [...pathFromA].reverse();
+
+  if (pathFromB.length <= 1) {
+    return reversedA.map((id: string) => personLabel(id));
+  }
+
+  const targetBranch = pathFromB.map((id: string) => personLabel(id));
+  const rootBranch = reversedA.slice(1).map((id: string) => personLabel(id));
+
+  return [...targetBranch, ...rootBranch];
+}
+
 async function findRelationship(
   supabase: ReturnType<typeof createClient>,
   args: Record<string, unknown>
@@ -779,6 +815,16 @@ async function findRelationship(
   lines.push(
     `Common ancestor: ${best.common_ancestor_name} (${best.generations_from_a} generation${best.generations_from_a !== 1 ? "s" : ""} from you, ${best.generations_from_b} generation${best.generations_from_b !== 1 ? "s" : ""} from them).`
   );
+
+  if (best.path_from_a && best.path_from_a.length > 0) {
+    const trace = await buildLineageTrace(
+      supabase,
+      best.path_from_a,
+      best.path_from_b || [targetPerson.id as string]
+    );
+    lines.push("", "Lineage trace:");
+    lines.push(trace.join(" → "));
+  }
 
   if (rels.length > 1) {
     lines.push("", "Other common ancestors:");
