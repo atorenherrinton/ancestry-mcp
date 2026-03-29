@@ -295,12 +295,12 @@ async function captureAncestorNote(
     source: "mcp",
   };
 
-  const { error } = await supabase.from("ancestor_notes").insert({
+  const { data: inserted, error } = await supabase.from("ancestor_notes").insert({
     ancestor_id: ancestor?.id ?? null,
     content,
     embedding: toVectorLiteral(embedding),
     metadata: metadataWithSource,
-  });
+  }).select("id").single();
 
   if (error) {
     throw new Error(error.message);
@@ -335,7 +335,96 @@ async function captureAncestorNote(
     confirmation += ` | Era: ${timePeriod}`;
   }
 
-  return { message: confirmation };
+  return { message: confirmation, note_id: inserted.id as string };
+}
+
+async function updateAncestorNote(
+  supabase: ReturnType<typeof createClient>,
+  args: Record<string, unknown>
+) {
+  const noteId = typeof args.note_id === "string" ? args.note_id.trim() : "";
+  if (!noteId) {
+    throw new Error("note_id is required.");
+  }
+
+  const newContent = typeof args.content === "string" ? normalizeNoteContent(args.content) : undefined;
+  const ancestorName = typeof args.ancestor_name === "string" ? args.ancestor_name : undefined;
+
+  if (!newContent && ancestorName === undefined) {
+    throw new Error("At least one of content or ancestor_name must be provided.");
+  }
+
+  const { data: existing, error: fetchErr } = await supabase
+    .from("ancestor_notes")
+    .select("id")
+    .eq("id", noteId)
+    .single();
+
+  if (fetchErr || !existing) {
+    throw new Error(`No note found with ID "${noteId}".`);
+  }
+
+  const updates: Record<string, unknown> = {};
+
+  if (newContent) {
+    if (newContent.length > MAX_NOTE_CHARS) {
+      throw new Error(`Note is too long (${newContent.length} chars). Max allowed is ${MAX_NOTE_CHARS}.`);
+    }
+    const [embedding, metadata] = await Promise.all([
+      getEmbedding(newContent),
+      extractNoteMetadata(newContent),
+    ]);
+    updates.content = newContent;
+    updates.embedding = toVectorLiteral(embedding);
+    updates.metadata = { ...(metadata ?? {}), source: "mcp" };
+  }
+
+  if (ancestorName !== undefined) {
+    const ancestor = await resolveAncestorByName(supabase, ancestorName || undefined);
+    updates.ancestor_id = ancestor?.id ?? null;
+  }
+
+  const { error } = await supabase
+    .from("ancestor_notes")
+    .update(updates)
+    .eq("id", noteId);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return { message: `Updated note ${noteId}.` };
+}
+
+async function deleteAncestorNote(
+  supabase: ReturnType<typeof createClient>,
+  args: Record<string, unknown>
+) {
+  const noteId = typeof args.note_id === "string" ? args.note_id.trim() : "";
+  if (!noteId) {
+    throw new Error("note_id is required.");
+  }
+
+  const { data: existing, error: fetchErr } = await supabase
+    .from("ancestor_notes")
+    .select("id")
+    .eq("id", noteId)
+    .single();
+
+  if (fetchErr || !existing) {
+    throw new Error(`No note found with ID "${noteId}".`);
+  }
+
+  const { error } = await supabase
+    .from("ancestor_notes")
+    .delete()
+    .eq("id", noteId);
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return { message: `Deleted note ${noteId}.` };
 }
 
 async function searchAncestorNotes(
@@ -379,6 +468,7 @@ async function searchAncestorNotes(
       typeof note.similarity === "number" ? `${(note.similarity * 100).toFixed(1)}%` : "n/a";
 
     lines.push(`--- Result ${index + 1} (${similarity} match) ---`);
+    lines.push(`Note ID: ${String(note.id)}`);
     if (note.created_at) {
       lines.push(`Captured: ${new Date(String(note.created_at)).toLocaleDateString()}`);
     }
@@ -458,7 +548,7 @@ async function listAncestorNotes(
       metadata.type ?? "??"
     )}${topics ? ` - ${topics}` : ""})${ancestor ? ` [${String(ancestor)}]` : ""}`;
 
-    return `${header}\n   ${String(note.content ?? "")}`;
+    return `${header}\n   Note ID: ${String(note.id)}\n   ${String(note.content ?? "")}`;
   });
 
   return { message: lines.join("\n\n") };
@@ -967,6 +1057,38 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     },
     async (args: unknown) => {
       const result = await captureAncestorNote(supabase, args as Record<string, unknown>);
+      return { content: [{ type: "text", text: `${result.message}\nNote ID: ${result.note_id}` }] };
+    }
+  );
+
+  server.registerTool(
+    "update_ancestor_note",
+    {
+      description:
+        "Update an existing ancestor note by ID. Re-generates the semantic embedding and re-extracts metadata when content changes. Can also re-link to a different ancestor.",
+      inputSchema: z.object({
+        note_id: z.string(),
+        content: z.string().optional(),
+        ancestor_name: z.string().optional(),
+      }),
+    },
+    async (args: unknown) => {
+      const result = await updateAncestorNote(supabase, args as Record<string, unknown>);
+      return { content: [{ type: "text", text: result.message }] };
+    }
+  );
+
+  server.registerTool(
+    "delete_ancestor_note",
+    {
+      description:
+        "Permanently delete an ancestor note by ID.",
+      inputSchema: z.object({
+        note_id: z.string(),
+      }),
+    },
+    async (args: unknown) => {
+      const result = await deleteAncestorNote(supabase, args as Record<string, unknown>);
       return { content: [{ type: "text", text: result.message }] };
     }
   );
