@@ -504,6 +504,7 @@ async function listAncestorNotes(
   const topic = typeof args.topic === "string" ? args.topic : undefined;
   const days = Number(args.days);
   const ancestorName = typeof args.ancestor_name === "string" ? args.ancestor_name : undefined;
+  const ancestorId = typeof args.ancestor_id === "string" ? args.ancestor_id : undefined;
 
   let query = supabase
     .from("ancestor_notes")
@@ -523,6 +524,9 @@ async function listAncestorNotes(
   }
   if (ancestorName) {
     query = query.ilike("ancestors.name", `%${ancestorName}%`);
+  }
+  if (ancestorId) {
+    query = query.eq("ancestor_id", ancestorId);
   }
 
   const { data, error } = await query;
@@ -1116,12 +1120,13 @@ async function handleMcpRequest(req: Request, supabase: ReturnType<typeof create
     "list_ancestor_notes",
     {
       description:
-        "List personal ancestor notes, optionally filtered by type, topic, ancestor name, or recent days.",
+        "List personal ancestor notes, optionally filtered by type, topic, ancestor name, ancestor ID, or recent days.",
       inputSchema: z.object({
         limit: z.number().optional(),
         type: z.string().optional(),
         topic: z.string().optional(),
         ancestor_name: z.string().optional(),
+        ancestor_id: z.string().optional(),
         days: z.number().optional(),
       }),
       annotations: { readOnlyHint: true },

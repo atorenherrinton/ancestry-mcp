@@ -417,7 +417,7 @@ const TOOLS = [
   {
     name: "list_ancestor_notes",
     description:
-      "List personal ancestor notes with optional filters by type, topic, ancestor name, or time range.",
+      "List personal ancestor notes with optional filters by type, topic, ancestor name, ancestor ID, or time range.",
     inputSchema: {
       type: "object",
       properties: {
@@ -425,6 +425,7 @@ const TOOLS = [
         type: { type: "string", description: "Filter: story, research_note, source_reference, question, observation" },
         topic: { type: "string", description: "Filter by topic tag" },
         ancestor_name: { type: "string", description: "Filter by ancestor name (fuzzy matched)" },
+        ancestor_id: { type: "string", description: "Filter by ancestor UUID directly" },
         days: { type: "number", description: "Only notes from the last N days" },
       },
     },
@@ -751,7 +752,7 @@ async function handleSearchAncestorNotes({ query, ancestor_name, limit = 10, thr
     .join("\n\n");
 }
 
-async function handleListAncestorNotes({ limit = 10, type, topic, ancestor_name, days }) {
+async function handleListAncestorNotes({ limit = 10, type, topic, ancestor_name, ancestor_id, days }) {
   let sql = `SELECT n.id, n.content, n.metadata, n.created_at, a.name AS ancestor_name
     FROM ancestor_notes n LEFT JOIN ancestors a ON a.id = n.ancestor_id`;
   const conditions = [];
@@ -769,6 +770,10 @@ async function handleListAncestorNotes({ limit = 10, type, topic, ancestor_name,
   if (ancestor_name) {
     conditions.push(`a.name ILIKE $${idx++}`);
     params.push(`%${ancestor_name}%`);
+  }
+  if (ancestor_id) {
+    conditions.push(`n.ancestor_id = $${idx++}`);
+    params.push(ancestor_id);
   }
   if (days) {
     conditions.push(`n.created_at >= now() - interval '${parseInt(days)} days'`);
