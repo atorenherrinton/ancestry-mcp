@@ -251,7 +251,7 @@ async function resolveAncestorByName(
     .limit(1);
 
   if (error) {
-    throw error;
+    throw new Error(error.message);
   }
 
   return data?.[0] ?? null;
@@ -303,7 +303,7 @@ async function captureAncestorNote(
   });
 
   if (error) {
-    throw error;
+    throw new Error(error.message);
   }
 
   const topics = Array.isArray((metadataWithSource as Record<string, unknown>).topics)
@@ -364,7 +364,7 @@ async function searchAncestorNotes(
   });
 
   if (error) {
-    throw error;
+    throw new Error(error.message);
   }
 
   const rows = data ?? [];
@@ -437,7 +437,7 @@ async function listAncestorNotes(
 
   const { data, error } = await query;
   if (error) {
-    throw error;
+    throw new Error(error.message);
   }
 
   const rows = data ?? [];
@@ -493,7 +493,7 @@ async function buildStats(supabase: ReturnType<typeof createClient>) {
     .order("name", { ascending: true });
 
   if (error) {
-    throw error;
+    throw new Error(error.message);
   }
 
   const countries = new Map<string, number>();
@@ -587,7 +587,7 @@ async function searchAncestors(
   });
 
   if (error) {
-    throw error;
+    throw new Error(error.message);
   }
 
   if (!lineage || !data?.length) {
@@ -600,7 +600,7 @@ async function searchAncestors(
   });
 
   if (lineageError) {
-    throw lineageError;
+    throw new Error(lineageError.message);
   }
 
   return {
@@ -689,7 +689,7 @@ async function buildPathDescription(
     .select("id, name, sex")
     .in("id", intermediateIds);
 
-  if (error) throw error;
+  if (error) throw new Error(error.message);
 
   const byId = new Map((data ?? []).map((r: Record<string, unknown>) => [r.id, r]));
   const parts = intermediateIds.map((id: string) => {
@@ -712,7 +712,7 @@ async function buildLineageTrace(
     .select("id, name, birth_date")
     .in("id", allIds);
 
-  if (error) throw error;
+  if (error) throw new Error(error.message);
 
   const byId = new Map((data ?? []).map((r: Record<string, unknown>) => [r.id, r]));
 
@@ -751,7 +751,7 @@ async function findRelationship(
     .eq("gedcom_xref", rootXref)
     .limit(1);
 
-  if (rootErr) throw rootErr;
+  if (rootErr) throw new Error(rootErr.message);
   if (!rootRows?.length) {
     return { message: `Could not find root person with GEDCOM xref "${rootXref}".` };
   }
@@ -764,7 +764,7 @@ async function findRelationship(
       .select("id, name, sex")
       .eq("id", args.ancestor_id)
       .limit(1);
-    if (error) throw error;
+    if (error) throw new Error(error.message);
     if (!data?.length) return { message: `No ancestor found with ID "${args.ancestor_id}".` };
     targetPerson = data[0];
   } else if (args.ancestor_name) {
@@ -775,7 +775,7 @@ async function findRelationship(
       .select("id, name, sex")
       .eq("id", resolved.id)
       .limit(1);
-    if (error) throw error;
+    if (error) throw new Error(error.message);
     targetPerson = data?.[0] ?? null;
   } else {
     return { message: "Please provide an ancestor_name or ancestor_id." };
@@ -793,7 +793,7 @@ async function findRelationship(
     max_depth: 30,
   });
 
-  if (relErr) throw relErr;
+  if (relErr) throw new Error(relErr.message);
   if (!rels?.length) {
     return { message: `No relationship found between you (${rootPerson.name}) and ${targetPerson.name} within 30 generations.` };
   }

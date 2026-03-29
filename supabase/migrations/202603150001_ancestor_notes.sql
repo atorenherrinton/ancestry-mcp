@@ -54,7 +54,7 @@ returns table (
 )
 language plpgsql
 stable
-set search_path = public
+set search_path = public, extensions
 as $$
 begin
   return query
