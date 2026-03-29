@@ -965,6 +965,8 @@ function formatAncestor(person: Record<string, unknown>) {
     lines[0] += ` (${sex === "M" ? "Male" : sex === "F" ? "Female" : sex})`;
   }
 
+  if (person.id) lines.push(`  ID: ${String(person.id)}`);
+
   const born = [person.birth_date, person.birth_place].filter(Boolean).join(", ");
   const died = [person.death_date, person.death_place].filter(Boolean).join(", ");
 
