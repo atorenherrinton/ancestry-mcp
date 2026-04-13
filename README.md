@@ -1,4 +1,4 @@
-# Open Brain Ancestry MCP
+# Ancestry MCP
 
 Standalone MCP server for ancestry and lineage queries, now compatible with Supabase-hosted Postgres and Edge Functions.
 
